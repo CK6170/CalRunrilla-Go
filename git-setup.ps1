@@ -80,6 +80,22 @@ if ($existingRemotes -contains 'origin') {
 
 # Push branch
 Write-Host "Pushing branch '$Branch' to origin..."
+# Ensure the local branch exists (create if necessary)
+$branchExists = $false
+& git show-ref --verify --quiet "refs/heads/$Branch"
+if ($LASTEXITCODE -eq 0) { $branchExists = $true }
+
+if (-not $branchExists) {
+    Write-Host "Local branch '$Branch' does not exist. Creating it..."
+    # If there are no commits, create an initial empty commit first
+    & git rev-parse --verify HEAD > $null 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host 'No commits found in repository - creating an initial empty commit.'
+        if (Invoke-GitCommand @('commit','--allow-empty','-m',$CommitMessage) -ne 0) { Write-Error 'git commit (empty) failed'; exit 1 }
+    }
+    if (Invoke-GitCommand @('branch',$Branch) -ne 0) { Write-Error "failed to create branch $Branch"; exit 1 }
+}
+
 if (Invoke-GitCommand @('push','-u','origin',$Branch) -ne 0) {
     Write-Error 'git push failed. If the remote repository is empty, ensure you have permission and the branch name is correct.'
     exit 1
