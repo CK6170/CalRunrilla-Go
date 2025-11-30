@@ -1,0 +1,26 @@
+{
+  "SERIAL": {
+    "PORT": "COM5",
+    "BAUDRATE": 115200,
+    "COMMAND": "M"
+  },
+  "VERSION": {
+    "ID": 12009,
+    "MAJOR": 1,
+    "MINOR": 205
+  },
+  "WEIGHT": 500,
+  "AVG": 2,
+  "IGNORE": 2,
+  "DEBUG": true,
+  "BARS": [
+    {
+      "ID": 0,
+      "LCS": 3
+    },
+    {
+      "ID": 1,
+      "LCS": 3
+    }
+  ]
+}

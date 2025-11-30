@@ -1,0 +1,19 @@
+# Binaries
+*.exe
+*.exe~
+calrunrilla
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Go
+bin/
+pkg/
+
+# Others
+*.version

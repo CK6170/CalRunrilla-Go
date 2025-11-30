@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      - name: Get version from tag
+        id: ver
+        run: |
+          if [ -n "${GITHUB_REF##refs/tags/}" ]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            echo "tag=$TAG" >> $GITHUB_OUTPUT
+          else
+            echo "tag=dev" >> $GITHUB_OUTPUT
+          fi
+      - name: Build
+        run: |
+          if [ "${{ steps.ver.outputs.tag }}" = "dev" ]; then
+            ldflags="-X main.AppVersion=dev -X main.AppBuild=local"
+          else
+            # strip leading v if present
+            ver=${{ steps.ver.outputs.tag }}
+            ver=${ver#v}
+            buildnum=$(date +%Y%m%d)
+            ldflags="-X main.AppVersion=${ver} -X main.AppBuild=${buildnum}"
+          fi
+          echo "ldflags=$ldflags"
+          go build -ldflags "$ldflags" -o calrunrilla .
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: calrunrilla
+          path: calrunrilla
