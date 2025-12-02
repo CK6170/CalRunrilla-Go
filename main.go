@@ -108,6 +108,10 @@ func main() {
 	// Check for flash flag (--flash or -f) to flash calibrated parameters directly
 	doFlashOnly := false
 	for _, a := range os.Args[1:] {
+		if a == "--help" || a == "-h" {
+			printHelp()
+			return
+		}
 		if a == "--test" || a == "-t" {
 			doTestOnly = true
 		}
@@ -457,6 +461,22 @@ func main() {
 			break
 		}
 	}
+}
+
+func printHelp() {
+	fmt.Printf("Runrilla Calibration version: %s [build %s]\n", AppVersion, AppBuild)
+	fmt.Println("Usage: calrunrilla <config.json>")
+	fmt.Println()
+	fmt.Println("Options:")
+	fmt.Println("  --test, -t <config.json>    Run test mode with the specified config")
+	fmt.Println("  --flash, -f <config.json>   Flash calibrated parameters from a _calibrated.json file")
+	fmt.Println("  --help, -h                  Show this help message")
+	fmt.Println("  --version, -v               Show version information")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  calrunrilla config.json              # Run full calibration")
+	fmt.Println("  calrunrilla -t config.json           # Run test mode")
+	fmt.Println("  calrunrilla -f config_calibrated.json # Flash calibrated parameters")
 }
 
 func calRunrilla(args0 string, barsPerRow int) {
