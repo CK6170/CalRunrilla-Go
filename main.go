@@ -105,9 +105,14 @@ func main() {
 
 	// Check for a simple test flag (--test or -t) to run the last calibration test directly
 	doTestOnly := false
+	// Check for flash flag (--flash or -f) to flash calibrated parameters directly
+	doFlashOnly := false
 	for _, a := range os.Args[1:] {
 		if a == "--test" || a == "-t" {
 			doTestOnly = true
+		}
+		if a == "--flash" || a == "-f" {
+			doFlashOnly = true
 		}
 	}
 
@@ -133,6 +138,146 @@ func main() {
 	}
 	if configPath == "" {
 		log.Fatal("Usage: calrunrilla <config.json>")
+	}
+
+	// Check for flash mode: if --flash or -f flag is present, load and flash directly
+	if doFlashOnly {
+		// Route the standard logger output through our package-scope redWriter
+		log.SetFlags(0)
+		log.SetOutput(redWriter{os.Stderr})
+
+		// Flash mode
+		clearScreen()
+		greenPrintf("Runrilla Calibration version: %s [build %s]\n", AppVersion, AppBuild)
+		greenPrintf("--------------------------------------------\n")
+		greenPrintf("Flash mode: loading calibrated parameters from %s\n", configPath)
+
+		jsonData, err := os.ReadFile(configPath)
+		if err != nil {
+			log.Fatalf("Error reading file: %v", err)
+		}
+		var parameters PARAMETERS
+		if err := json.Unmarshal(jsonData, &parameters); err != nil {
+			log.Fatalf("JSON error: %v", err)
+		}
+		lastParameters = &parameters
+		debugPrintf(true, "Loaded calibrated config: %s\n", configPath)
+
+		// Validate that the file contains calibrated parameters
+		if len(parameters.BARS) == 0 || len(parameters.BARS[0].LC) == 0 {
+			log.Fatal("The config file does not contain calibrated parameters (LC array is empty). Please use a _calibrated.json file generated after calibration.")
+		}
+
+		if parameters.SERIAL == nil {
+			log.Fatal("Missing SERIAL section in JSON")
+		}
+		// Serial validation/auto-detect (same as calRunrilla)
+		debugPrintf(true, "Validating SERIAL configuration...\n")
+		needDetect := false
+		if parameters.SERIAL.PORT == "" {
+			debugPrintf(true, "Serial PORT missing in JSON, attempting auto-detect...\n")
+			needDetect = true
+		} else {
+			debugPrintf(true, "Trying configured port: %s (baud %d)\n", parameters.SERIAL.PORT, parameters.SERIAL.BAUDRATE)
+			cfg := &serial.Config{Name: parameters.SERIAL.PORT, Baud: parameters.SERIAL.BAUDRATE, Parity: serial.ParityNone, Size: 8, StopBits: serial.Stop1, ReadTimeout: time.Millisecond * 300}
+			sp, err := serial.OpenPort(cfg)
+			if err != nil {
+				log.Printf("Port %s open failed (%v), attempting auto-detect...\n", parameters.SERIAL.PORT, err)
+				needDetect = true
+			} else {
+				_ = sp.Close()
+			}
+		}
+		if needDetect {
+			debugPrintf(true, "Starting serial auto-detect across COM ports (this may take a few seconds)...\n")
+			p := autoDetectPort(&parameters)
+			if p == "" {
+				log.Fatal("Could not auto-detect serial port")
+			}
+			parameters.SERIAL.PORT = p
+			persistParameters(configPath, &parameters)
+			debugPrintf(true, "Detected serial port: %s (saved to JSON)\n", p)
+		}
+
+		debugPrintf(true, "Opening Leo485 with port %s...\n", parameters.SERIAL.PORT)
+		bars := serialpkg.NewLeo485(parameters.SERIAL, parameters.BARS)
+		defer func() { _ = bars.Close() }()
+
+		// Probe version and attempt reboot/auto-detect fallback like calRunrilla
+		debugPrintf(true, "Probing device version...\n")
+		if !probeVersion(bars, &parameters) {
+			log.Printf("No version response from %s. Attempting reboot of all bars...\n", parameters.SERIAL.PORT)
+			for i := range bars.Bars {
+				if bars.Reboot(i) {
+					greenPrintf("Bar %d reboot command sent\n", i+1)
+				} else {
+					log.Printf("Bar %d reboot command failed or no response\n", i+1)
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			greenPrintf("Waiting for bars to reboot...\n")
+			time.Sleep(1500 * time.Millisecond)
+			if probeVersion(bars, &parameters) {
+				greenPrintf("Version response received after reboot\n")
+			} else {
+				log.Printf("No version response from %s after reboot, re-attempting auto-detect...\n", parameters.SERIAL.PORT)
+				_ = bars.Close()
+				p := autoDetectPort(&parameters)
+				if p != "" && p != parameters.SERIAL.PORT {
+					parameters.SERIAL.PORT = p
+					persistParameters(configPath, &parameters)
+					debugPrintf(true, "Updated serial port after probe: %s (saved)\n", p)
+					bars = serialpkg.NewLeo485(parameters.SERIAL, parameters.BARS)
+					defer func() { _ = bars.Close() }()
+				}
+			}
+		}
+
+		// Full version validation (will continue even if minor mismatch)
+		if !checkVersion(bars, &parameters) {
+			// Version check failed but continue
+			warningPrintf("Warning: version check failed, continuing anyway\n")
+		}
+
+		// Display loaded factors and zeros
+		nbars := len(parameters.BARS)
+		if nbars > 0 {
+			nlcs := len(parameters.BARS[0].LC)
+			// Show factors
+			for i := 0; i < nbars; i++ {
+				fmt.Print("\033[38;5;208m")
+				fmt.Println(matrix.MatrixLine)
+				fmt.Printf("Bar %d factors:\n", i+1)
+				for j := 0; j < nlcs; j++ {
+					f := parameters.BARS[i].LC[j].FACTOR
+					hex := parameters.BARS[i].LC[j].IEEE
+					fmt.Printf("[%03d]   % .12f  %s\n", j, float64(f), hex)
+				}
+				fmt.Println(matrix.MatrixLine)
+				fmt.Println()
+				fmt.Print("\033[0m")
+			}
+			// Show zeros
+			fmt.Print("\033[38;5;208m")
+			fmt.Println(matrix.MatrixLine)
+			fmt.Println("zeros (from calibrated file)")
+			for i := 0; i < nbars; i++ {
+				fmt.Printf("Bar %d zeros:\n", i+1)
+				for j := 0; j < nlcs; j++ {
+					z := parameters.BARS[i].LC[j].ZERO
+					fmt.Printf("[%03d]  %12.0f\n", j, float64(z))
+				}
+				fmt.Println(matrix.MatrixLine)
+			}
+			fmt.Print("\033[0m")
+		}
+
+		greenPrintf("\nFlashing bars with calibrated parameters...\n")
+		if err := flashParameters(bars, &parameters); err != nil {
+			log.Fatalf("Flash failed: %v", err)
+		}
+		greenPrintf("All bars flashed successfully!\n")
+		return
 	}
 
 	// Route the standard logger output through our package-scope redWriter
