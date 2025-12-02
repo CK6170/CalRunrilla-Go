@@ -78,9 +78,6 @@ type LC = models.LC
 type LMR = models.LMR
 type FB = models.FB
 type BAY = models.BAY
-type Matrix = matrix.Matrix
-type Vector = matrix.Vector
-type Leo485 = serialpkg.Leo485
 
 var (
 	calibmsg       = "\nPut %d on the %s Bay on the %s side in the %s of the Shelf and Press 'C' to continue. Or <ESC> to exit."
@@ -108,6 +105,14 @@ func main() {
 		log.Fatal("Usage: calrunrilla <config.json>")
 	}
 
+	// Check for a simple test flag (--test or -t) to run the last calibration test directly
+	doTestOnly := false
+	for _, a := range os.Args[1:] {
+		if a == "--test" || a == "-t" {
+			doTestOnly = true
+		}
+	}
+
 	// Support a simple version flag for CI and quick checks. If any argument is
 	// `-v` or `--version` print a plain-text version and exit before any other
 	// output so it is always visible and never treated as a config filename.
@@ -130,6 +135,48 @@ func main() {
 	}
 	if configPath == "" {
 		log.Fatal("Usage: calrunrilla <config.json>")
+	}
+
+	if doTestOnly {
+		// Load parameters and immediately run testWeights using the serial port
+		jsonData, err := os.ReadFile(configPath)
+		if err != nil {
+			log.Fatalf("Error reading file: %v", err)
+		}
+		var parameters PARAMETERS
+		if err := json.Unmarshal(jsonData, &parameters); err != nil {
+			log.Fatalf("JSON error: %v", err)
+		}
+		lastParameters = &parameters
+		if parameters.SERIAL == nil {
+			log.Fatal("Missing SERIAL section in JSON")
+		}
+		// Try to open serial / auto-detect as in calRunrilla
+		needDetect := false
+		if parameters.SERIAL.PORT == "" {
+			needDetect = true
+		} else {
+			cfg := &serial.Config{Name: parameters.SERIAL.PORT, Baud: parameters.SERIAL.BAUDRATE, Parity: serial.ParityNone, Size: 8, StopBits: serial.Stop1, ReadTimeout: time.Millisecond * 300}
+			sp, err := serial.OpenPort(cfg)
+			if err != nil {
+				needDetect = true
+			} else {
+				_ = sp.Close()
+			}
+		}
+		if needDetect {
+			p := autoDetectPort(&parameters)
+			if p == "" {
+				log.Fatal("Could not auto-detect serial port")
+			}
+			parameters.SERIAL.PORT = p
+		}
+
+		greenPrintf("\nOpening serial port %s for test...\n", parameters.SERIAL.PORT)
+		bars := serialpkg.NewLeo485(parameters.SERIAL, parameters.BARS)
+		defer func() { _ = bars.Close() }()
+		testWeights(bars, &parameters)
+		return
 	}
 
 	// Route the standard logger output through our package-scope redWriter
@@ -157,8 +204,30 @@ func main() {
 			continue
 		}
 
-		// Use the green single-key prompt so 'R' works without Enter
-		if !nextRetryOrExit() {
+		// Use the green single-key prompt so 'T' (Test), 'R' (Retry) or ESC work without Enter
+		choice := nextTestRetryOrExit()
+		if choice == 'R' {
+			break // restart loop handled by immediateRetry below if needed
+		}
+		if choice == 'T' {
+			// Run weight test using lastParameters if available
+			if lastParameters != nil && lastParameters.SERIAL != nil {
+				ui.DrainKeys()
+				greenPrintf("\nOpening serial port %s for test...\n", lastParameters.SERIAL.PORT)
+				bars := serialpkg.NewLeo485(lastParameters.SERIAL, lastParameters.BARS)
+				_ = bars.Close()
+				// Reopen to ensure clean state and run test
+				bars = serialpkg.NewLeo485(lastParameters.SERIAL, lastParameters.BARS)
+				testWeights(bars, lastParameters)
+				_ = bars.Close()
+			} else {
+				warningPrintf("No parameters available for testing\n")
+			}
+			// after test, continue outer loop to show banner again
+			continue
+		}
+		// ESC or other: exit
+		if choice == 27 {
 			break
 		}
 	}
@@ -295,13 +364,76 @@ func calRunrilla(args0 string, barsPerRow int) {
 		printMatrix(add, "Difference Matrix (adv - ad0)")
 		w = matrix.NewVectorWithValue(adv.Rows, float64(parameters.WEIGHT))
 		printVector(w, "Load Vector (W)")
+
+		// Print zeros taken directly from ad0 (no averaging) between Load Vector and Check
+		zerosVec := ad0.GetRow(0)
+		fmt.Print("\033[38;5;208m")
+		fmt.Println(matrix.MatrixLine)
+		// Print zeros grouped by Bar (Bar 1 zeros, Bar 2 zeros, ...). Use bars.NLCs because
+		// parameters.BARS[].LC isn't populated until after calcZerosFactors.
+		idx := 0
+		nlcsPerBar := bars.NLCs
+		for bi := 0; bi < len(parameters.BARS); bi++ {
+			fmt.Printf("Bar %d zeros:\n", bi+1)
+			for j := 0; j < nlcsPerBar; j++ {
+				fmt.Printf("[%03d]  %12.0f\n", j, zerosVec.Values[idx])
+				idx++
+			}
+			fmt.Println(matrix.MatrixLine)
+		}
+		fmt.Print("\033[0m")
 	}
 
 	// Calculate factors
-	debug := calcZerosFactors(adv, ad0, &parameters)
+	debug, factorsVec, adiNorm := calcZerosFactors(adv, ad0, &parameters)
 
-	// Add to debug file
+	// Also print per-bar factors (same style as test mode) so operator can review before flashing
+	nbars := len(parameters.BARS)
+	if nbars > 0 {
+		fmt.Print("\033[38;5;208m")
+		for i := 0; i < nbars; i++ {
+			nlcs := len(parameters.BARS[i].LC)
+			fmt.Println(matrix.MatrixLine)
+			fmt.Printf("Bar %d factors:\n", i+1)
+			for j := 0; j < nlcs; j++ {
+				f := float32(parameters.BARS[i].LC[j].FACTOR)
+				hex := fmt.Sprintf("%08X", matrix.ToIEEE754(f))
+				// match test-mode decimal precision
+				fmt.Printf("[%03d]   % .12f  %s\n", j, float64(f), hex)
+			}
+			fmt.Println(matrix.MatrixLine)
+			fmt.Println()
+		}
+		// Reset color after printing per-bar factors (zeros from ad0 are shown earlier)
+		fmt.Print("\033[0m")
+	}
+
+	// If DEBUG, print the Check block (re-using the check computed from add * factors)
 	if parameters.DEBUG {
+		// Ensure we have 'add' and 'w' to perform the check
+		add := adv.Sub(ad0)
+		w := matrix.NewVectorWithValue(adv.Rows, float64(parameters.WEIGHT))
+		check := add.MulVector(factorsVec)
+		// Yellow color for the diagnostic Check block
+		fmt.Print("\033[33m")
+		debug = recordData(debug, check, "Check", "%8.1f")
+		fmt.Println(matrix.MatrixLine)
+		norm := check.Sub(w).Norm() / float64(parameters.WEIGHT)
+		fmt.Printf("Error: %e\n", norm)
+		debug += fmt.Sprintf("Error,%e\n", norm)
+		fmt.Println(matrix.MatrixLine)
+
+		fmt.Printf("Pseudoinverse Norm: %e\n", adiNorm)
+		debug += fmt.Sprintf("PseudoinverseNorm,%e\n", adiNorm)
+		fmt.Println(matrix.MatrixLine)
+		fmt.Print("\033[0m")
+		debug += matrix.MatrixLine + "\n"
+
+		// Add to debug file
+		res := fmt.Sprintf("%s,%s", time.Now().Format("2006-01-02 15:04:05"), debug)
+		appendToFile(strings.Replace(args0, ".json", "_debug.csv", 1), res)
+	} else {
+		// Non-DEBUG: still append debug CSV data silently
 		res := fmt.Sprintf("%s,%s", time.Now().Format("2006-01-02 15:04:05"), debug)
 		appendToFile(strings.Replace(args0, ".json", "_debug.csv", 1), res)
 	}
@@ -333,14 +465,22 @@ func calRunrilla(args0 string, barsPerRow int) {
 			}
 		}
 	case 'N':
-		// Show green prompt asking to Retry (R) or Exit (ESC)
-		retry := nextRetryOrExit()
-		if retry {
-			immediateRetry = true
-			return
+		// Offer Test (T), Retry (R) or Exit (ESC)
+		for {
+			choice := nextTestRetryOrExit()
+			if choice == 'T' {
+				// Run weight check routine (non-destructive)
+				testWeights(bars, &parameters)
+				// after test, loop back to offer options again
+				continue
+			}
+			if choice == 'R' {
+				immediateRetry = true
+				return
+			}
+			// ESC or any other -> exit
+			os.Exit(0)
 		}
-		// Otherwise exit
-		os.Exit(0)
 	case 27: // ESC
 		os.Exit(0)
 	}
@@ -374,19 +514,12 @@ func nextYN(message string) rune {
 // nextRetryOrExit shows a green message and waits for a single 'R' (restart) or ESC (exit).
 // Returns true if user chose restart, false to exit.
 func nextRetryOrExit() bool {
-	msg := "\nPress 'R' to Retry, <ESC> to exit"
-	fmt.Printf("\033[32m%s\033[0m\n", msg)
-	ui.DrainKeys()
-	keyEvents := ui.StartKeyEvents()
-	for {
-		k := <-keyEvents
-		if k == 'R' || k == 'r' {
-			return true
-		}
-		if k == 27 { // ESC
-			return false
-		}
+	// Reuse the Test/Retry/Exit prompt but map 'R' to true and ESC to false.
+	k := nextTestRetryOrExit()
+	if k == 'R' {
+		return true
 	}
+	return false
 }
 
 // nextFlashAction prompts the user after a flash failure: F to retry flash, S to skip, ESC to exit.
@@ -409,6 +542,281 @@ func nextFlashAction() rune {
 	}
 }
 
+// nextTestRetryOrExit shows a green message and waits for 'T' (test), 'R' (retry)
+// or ESC. Returns the rune pressed.
+func nextTestRetryOrExit() rune {
+	msg := "\nPress 'T' to Test, 'R' to Retry or <ESC> to exit"
+	fmt.Printf("\033[32m%s\033[0m\n", msg)
+	ui.DrainKeys()
+	keyEvents := ui.StartKeyEvents()
+	for {
+		k := <-keyEvents
+		if k == 'T' || k == 't' {
+			return 'T'
+		}
+		if k == 'R' || k == 'r' {
+			return 'R'
+		}
+		if k == 27 {
+			return 27
+		}
+	}
+}
+
+// testWeights performs the test flow described by the user:
+// 1) read factors from bars (parameters.BARS[].LC[].FACTOR)
+// 2) take AVG samples from each load cell as zero reference
+// 3) show data from all bars and LCs
+// 4) calculate weight per LC => W = (adc - zero_reference) * factor
+// 5) show per-LC weights
+// 6) show total weight per bar
+// 7) show total weight of all bars
+func testWeights(bars *serialpkg.Leo485, parameters *PARAMETERS) {
+	nbars := len(parameters.BARS)
+	nlcs := bars.NLCs
+
+	// Read factors (float64 slice per bar)
+	factors := make([][]float64, nbars)
+	for i := 0; i < nbars; i++ {
+		// Prefer device-reported factors when available. Fall back to JSON.
+		devf, err := bars.GetDeviceFactors(i)
+		if err == nil && devf != nil && len(devf) == nlcs {
+			factors[i] = devf
+			continue
+		}
+		lc := parameters.BARS[i].LC
+		f := make([]float64, len(lc))
+		for j := range lc {
+			f[j] = float64(lc[j].FACTOR)
+		}
+		factors[i] = f
+	}
+
+	// Show factors read (device or JSON) in high-precision decimal and IEEE754 hex like calibration
+	for i := 0; i < nbars; i++ {
+		fmt.Print("\033[38;5;208m")
+		fmt.Println(matrix.MatrixLine)
+		fmt.Printf("Bar %d factors:\n", i+1)
+		for j := 0; j < nlcs && j < len(factors[i]); j++ {
+			val := float32(factors[i][j])
+			hex := fmt.Sprintf("%08X", matrix.ToIEEE754(val))
+			// show decimal with 12 fraction digits to match calibration output
+			fmt.Printf("[%03d]  % .12f  %s\n", j, factors[i][j], hex)
+		}
+		fmt.Println(matrix.MatrixLine)
+		fmt.Print("\033[0m")
+	}
+
+	// initial zero reference: take a few quick samples and average
+	avgCount := parameters.AVG
+	if avgCount <= 0 {
+		avgCount = 100
+	}
+	ui.DrainKeys()
+	greenPrintf("\nCollecting %d samples for zero reference...\n", avgCount)
+	// accumulate sums
+	sums := make([][]float64, nbars)
+	for i := 0; i < nbars; i++ {
+		sums[i] = make([]float64, nlcs)
+	}
+	for s := 0; s < avgCount; s++ {
+		for i := 0; i < nbars; i++ {
+			bruts, err := bars.GetADs(i)
+			if err != nil || len(bruts) == 0 {
+				continue
+			}
+			for j := 0; j < nlcs && j < len(bruts); j++ {
+				sums[i][j] += float64(bruts[j])
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	zeros := make([][]float64, nbars)
+	for i := 0; i < nbars; i++ {
+		zeros[i] = make([]float64, nlcs)
+		for j := 0; j < nlcs; j++ {
+			zeros[i][j] = sums[i][j] / float64(avgCount)
+		}
+	}
+
+	// Show the zero references we just collected so the operator can inspect them
+	// Print in the same orange style used for factors/zeros in other debug output
+	fmt.Print("\033[38;5;208m")
+	fmt.Println(matrix.MatrixLine)
+	fmt.Println("zeros (averaged)")
+	for i := 0; i < nbars; i++ {
+		fmt.Printf("Bar %d zeros:\n", i+1)
+		for j := 0; j < nlcs; j++ {
+			fmt.Printf("[%03d]  %12.0f\n", j, zeros[i][j])
+		}
+		fmt.Println(matrix.MatrixLine)
+	}
+	fmt.Print("\033[0m")
+
+	// Prepare interactive live display
+	keyEvents := ui.StartKeyEvents()
+	ui.DrainKeys()
+	firstPrint := true
+	printedLines := 0
+	greenPrintf("\nWeight check results (press 'R' to Recalibrate, 'Z' to Re-zero, <ESC> to exit):\n")
+	showDebug := false
+	for {
+		// sample once per bar
+		samples := make([][]float64, nbars)
+		barTotals := make([]float64, nbars)
+		grandTotal := 0.0
+		for i := 0; i < nbars; i++ {
+			samples[i] = make([]float64, nlcs)
+			bruts, err := bars.GetADs(i)
+			if err == nil && len(bruts) > 0 {
+				for j := 0; j < nlcs && j < len(bruts); j++ {
+					samples[i][j] = float64(bruts[j])
+				}
+			}
+			for j := 0; j < nlcs; j++ {
+				w := (samples[i][j] - zeros[i][j]) * factors[i][j]
+				barTotals[i] += w
+				grandTotal += w
+			}
+		}
+
+		// Build output block
+		var sb strings.Builder
+		for i := 0; i < nbars; i++ {
+			sb.WriteString(fmt.Sprintf("\nBar %d:\n", i+1))
+			for j := 0; j < nlcs; j++ {
+				// color per weight; show only ADC and W (no Zero/Factor columns)
+				w := (samples[i][j] - zeros[i][j]) * factors[i][j]
+				adc := samples[i][j]
+				// Format weight into a fixed-width field first, then add color escapes around that field so
+				// the visible text width remains constant (ANSI escapes don't count) and columns align.
+				// Use fixed-width LC index (2 digits) so multi-digit LC indexes do not shift columns.
+				weightField := fmt.Sprintf("W=%8.1f", w)
+				if w >= 0 {
+					// green weight (shifted right by 4 spaces)
+					sb.WriteString(fmt.Sprintf("  LC %2d:     \033[32m%s\033[0m  ADC=%12.0f\n", j+1, weightField, adc))
+				} else {
+					// red weight (shifted right by 4 spaces)
+					sb.WriteString(fmt.Sprintf("  LC %2d:     \033[31m%s\033[0m  ADC=%12.0f\n", j+1, weightField, adc))
+				}
+			}
+			sb.WriteString(fmt.Sprintf("  Bar total: \033[33m%10.1f\033[0m\n", barTotals[i]))
+		}
+		sb.WriteString(fmt.Sprintf("\nGrand total: \033[36m%10.1f\033[0m\n", grandTotal))
+		sb.WriteString("\n")
+
+		out := sb.String()
+		// Count lines
+		lines := strings.Count(out, "\n")
+
+		if !firstPrint {
+			// move cursor up to overwrite previous block (plus one to position correctly)
+			fmt.Printf("\033[%dA", printedLines)
+		}
+		fmt.Print(out)
+		printedLines = lines
+		firstPrint = false
+
+		// non-blocking check for key
+		select {
+		case k := <-keyEvents:
+			if k == 27 {
+				// Exit the entire program immediately when ESC is pressed during test
+				fmt.Println()
+				os.Exit(0)
+			}
+			if parameters.DEBUG && (k == 'D' || k == 'd') {
+				// Toggle debug view: pause live updates and render debug block
+				showDebug = !showDebug
+				if showDebug {
+					// render debug block and wait until toggled off
+					renderDebugView(bars, zeros, factors)
+					// when the user returns, reset printing state
+					firstPrint = true
+					printedLines = 0
+				} else {
+					firstPrint = true
+					printedLines = 0
+				}
+				continue
+			}
+			if k == 'R' || k == 'r' {
+				// Request a full recalibration (restart the app's calibration loop)
+				greenPrintf("\nRecalibration requested. Returning to main menu...\n")
+				// signal outer loop to immediately retry/recalibrate
+				immediateRetry = true
+				fmt.Println()
+				return
+			}
+			if k == 'Z' || k == 'z' {
+				// Re-zero: collect AVG samples again and update zeros reference
+				ui.DrainKeys()
+				// Print a standalone message and ensure the live-update block will be overwritten cleanly
+				greenPrintf("\nRe-zeroing: collecting %d samples for zero reference...\n", avgCount)
+				// accumulate sums
+				newSums := make([][]float64, nbars)
+				for i := 0; i < nbars; i++ {
+					newSums[i] = make([]float64, nlcs)
+				}
+				for s := 0; s < avgCount; s++ {
+					for i := 0; i < nbars; i++ {
+						bruts, err := bars.GetADs(i)
+						if err != nil || len(bruts) == 0 {
+							continue
+						}
+						for j := 0; j < nlcs && j < len(bruts); j++ {
+							newSums[i][j] += float64(bruts[j])
+						}
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+				for i := 0; i < nbars; i++ {
+					for j := 0; j < nlcs; j++ {
+						zeros[i][j] = newSums[i][j] / float64(avgCount)
+					}
+				}
+				greenPrintf("Re-zero complete.\n")
+				// Print the updated zeros so operator can verify the new references
+				fmt.Print("\033[38;5;208m")
+				fmt.Println(matrix.MatrixLine)
+				fmt.Println("zeros (re-averaged)")
+				for i := 0; i < nbars; i++ {
+					fmt.Printf("Bar %d zeros:\n", i+1)
+					for j := 0; j < nlcs; j++ {
+						fmt.Printf("[%03d]  %12.0f\n", j, zeros[i][j])
+					}
+					fmt.Println(matrix.MatrixLine)
+				}
+				fmt.Print("\033[0m")
+				// Reset printing state so next live block overwrites cleanly
+				firstPrint = true
+				printedLines = 0
+			}
+		default:
+		}
+
+		// small delay between live updates
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// getDeviceFactors queries the device with command 'X' for factors and parses
+// the response containing IEEE754 floats. Returns a slice of float64 of length
+// nlcs or nil on error/unavailable.
+
+// equalBytes is a small helper to compare two byte slices of equal length
+func equalBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func zeroCalibration(bars *serialpkg.Leo485, parameters *PARAMETERS) *matrix.Matrix {
 	ads, ok := showADCLabel(bars, zeromsg, "[ZERO]")
 	if !ok {
@@ -419,7 +827,7 @@ func zeroCalibration(bars *serialpkg.Leo485, parameters *PARAMETERS) *matrix.Mat
 	return updateMatrixZero(ads, 3*(len(parameters.BARS)-1), bars.NLCs)
 }
 
-func weightCalibration(bars *serialpkg.Leo485, parameters *PARAMETERS) *Matrix {
+func weightCalibration(bars *serialpkg.Leo485, parameters *PARAMETERS) *matrix.Matrix {
 	nlcs := bars.NLCs
 	nbars := len(parameters.BARS)
 	nloads := 3 * (nbars - 1) * nlcs
@@ -827,7 +1235,7 @@ func printVector(v *matrix.Vector, title string) {
 		fmt.Println()
 	}
 */
-func calcZerosFactors(adv, ad0 *matrix.Matrix, parameters *PARAMETERS) string {
+func calcZerosFactors(adv, ad0 *matrix.Matrix, parameters *PARAMETERS) (string, *matrix.Vector, float64) {
 	debug := "\n"
 	add := adv.Sub(ad0)
 	w := matrix.NewVectorWithValue(adv.Rows, float64(parameters.WEIGHT))
@@ -842,34 +1250,21 @@ func calcZerosFactors(adv, ad0 *matrix.Matrix, parameters *PARAMETERS) string {
 		log.Fatal("pseudoinverse multiplication failed")
 	}
 
-	// Zeros are first row of ad0
+	// Zeros are first row of ad0 (do not print here; accumulate debug CSV only)
 	zeros := ad0.GetRow(0)
-	recordData(debug, zeros, "Zeros", "%10.0f")
-	// Print only IEEE754-formatted factors block (no separate decimal-only list)
-	printFactorsIEEE(factors)
-
-	if parameters.DEBUG {
-		// Yellow color for debug diagnostics block
-		fmt.Print("\033[33m")
-		check := add.MulVector(factors)
-		// Show check with only one digit after the decimal point
-		recordData(debug, check, "Check", "%8.1f")
-		fmt.Println(matrix.MatrixLine)
-		norm := check.Sub(w).Norm() / float64(parameters.WEIGHT)
-		// Print diagnostics in yellow (debug-only)
-		fmt.Print("\033[33m")
-		fmt.Printf("Error: %e\n", norm)
-		debug += fmt.Sprintf("Error,%e\n", norm)
-		fmt.Println(matrix.MatrixLine)
-
-		fmt.Printf("Pseudoinverse Norm: %e\n", adi.Norm())
-		debug += fmt.Sprintf("PseudoinverseNorm,%e\n", adi.Norm())
-		fmt.Println(matrix.MatrixLine)
-		fmt.Print("\033[0m")
-		// Reset color after debug block
-		fmt.Print("\033[0m")
-		debug += matrix.MatrixLine + "\n"
+	// Build CSV debug content for zeros (no console printing here)
+	_, zerosCsv := zeros.ToStrings("Zeros", "%10.0f")
+	debug += zerosCsv + "\n"
+	// Build CSV debug content for factors (IEEE + decimal)
+	debug += "factors (IEEE754)\n"
+	for i, val := range factors.Values {
+		hex := fmt.Sprintf("%08X", matrix.ToIEEE754(float32(val)))
+		debug += fmt.Sprintf("[%03d],% .12f,%s\n", i, val, hex)
 	}
+	debug += "\n"
+
+	// compute adi Norm for diagnostics
+	adiNorm := adi.Norm()
 
 	nbars := len(parameters.BARS)
 	nlcs := zeros.Length / nbars
@@ -886,10 +1281,10 @@ func calcZerosFactors(adv, ad0 *matrix.Matrix, parameters *PARAMETERS) string {
 			parameters.BARS[i].LC[j] = lc
 		}
 	}
-	return debug
+	return debug, factors, adiNorm
 }
 
-func recordData(debug string, vec *Vector, title, format string) string {
+func recordData(debug string, vec *matrix.Vector, title, format string) string {
 	text, csv := vec.ToStrings(title, format)
 	// Orange (approx) for zeros and factors always
 	if title == "Zeros" || title == "factors" {
@@ -903,7 +1298,7 @@ func recordData(debug string, vec *Vector, title, format string) string {
 }
 
 // printFactorsIEEE prints the factors as IEEE754 hex with decimal values, matching requested formatting
-func printFactorsIEEE(factors *Vector) {
+func printFactorsIEEE(factors *matrix.Vector) {
 	// Orange color for factors
 	fmt.Print("\033[38;5;208m")
 	fmt.Println(matrix.MatrixLine)
@@ -916,6 +1311,52 @@ func printFactorsIEEE(factors *Vector) {
 	}
 	fmt.Println(matrix.MatrixLine)
 	fmt.Print("\033[0m")
+}
+
+// renderDebugView prints a compact debug block showing factors and zeros.
+// It waits for the user to press 'D' again (or ESC) to return.
+func renderDebugView(bars *serialpkg.Leo485, zeros [][]float64, factors [][]float64) {
+	ui.DrainKeys()
+	keyEvents := ui.StartKeyEvents()
+	fmt.Print("\033[38;5;208m")
+	fmt.Println(matrix.MatrixLine)
+	fmt.Println("DEBUG VIEW - factors and zeros (press D to close)")
+	for i := 0; i < len(bars.Bars); i++ {
+		fmt.Printf("Bar %d factors:\n", i+1)
+		if i < len(factors) {
+			for j := 0; j < bars.NLCs && j < len(factors[i]); j++ {
+				val := float32(factors[i][j])
+				hex := fmt.Sprintf("%08X", matrix.ToIEEE754(val))
+				fmt.Printf("[%03d]  % .12f  %s\n", j, factors[i][j], hex)
+			}
+		} else {
+			fmt.Println("  (no factors)")
+		}
+		fmt.Println(matrix.MatrixLine)
+
+		fmt.Printf("Bar %d zeros:\n", i+1)
+		if i < len(zeros) {
+			for j := 0; j < bars.NLCs; j++ {
+				fmt.Printf("[%03d]  %12.0f\n", j, zeros[i][j])
+			}
+		} else {
+			fmt.Println("  (no zeros)")
+		}
+		fmt.Println(matrix.MatrixLine)
+	}
+	fmt.Print("\033[0m")
+
+	// Wait until user toggles debug off
+	for {
+		select {
+		case k := <-keyEvents:
+			if k == 27 || k == 'D' || k == 'd' {
+				return
+			}
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
 }
 
 func saveToJSON(file string, parameters *PARAMETERS) {
@@ -1041,6 +1482,7 @@ func flashParameters(bars *serialpkg.Leo485, parameters *PARAMETERS) error {
 			zeravg = 0
 			warningPrintf("Avg. Zero reference is negative\n")
 		}
+		// factors/zeros already printed earlier during calibration; skip here
 		greenPrintf(" Flashing Zeros:\n")
 		// Attempt to write zeros with retries and debug logging
 		// Build the O command payload same as WriteZeros expects
