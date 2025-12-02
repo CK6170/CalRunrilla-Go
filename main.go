@@ -12,10 +12,32 @@ import (
 	"time"
 
 	matrix "github.com/CK6170/Calrunrilla-go/matrix"
-	models "github.com/CK6170/Calrunrilla-go/models"
+	"github.com/CK6170/Calrunrilla-go/models"
 	serialpkg "github.com/CK6170/Calrunrilla-go/serial"
 	ui "github.com/CK6170/Calrunrilla-go/ui"
 	"github.com/tarm/serial"
+)
+
+// Use canonical models from the `models` package. These type aliases keep the
+// rest of the code using the short names (e.g., PARAMETERS, BAR) while pointing
+// at the exported types in the models package.
+type PARAMETERS = models.PARAMETERS
+type SENTINEL = models.SENTINEL
+type VERSION = models.VERSION
+type SERIAL = models.SERIAL
+type BAR = models.BAR
+type LC = models.LC
+
+// Aliases for enums and other types
+type LMR = models.LMR
+type FB = models.FB
+type BAY = models.BAY
+
+const (
+	MAXLCS   = 4
+	WIDTH    = 21
+	SHIFT    = 14
+	SHIFTIDX = 6
 )
 
 // redWriter wraps an io.Writer and emits red-colored output. Defined at package scope
@@ -25,8 +47,19 @@ type redWriter struct{ w io.Writer }
 func (r redWriter) Write(p []byte) (int, error) {
 	out := append([]byte("\033[31m"), p...)
 	out = append(out, []byte("\033[0m")...)
-	return r.w.Write(out)
+	ret, err := r.w.Write(out)
+	if err != nil {
+		return ret, err
+	}
+	return ret, nil
 }
+
+var (
+	calibmsg       = "\nPut %d on the %s Bay on the %s side in the %s of the Shelf and Press 'C' to continue. Or <ESC> to exit."
+	zeromsg        = "\nClear the Bay(s) and Press 'C' to continue. Or <ESC> to exit."
+	lastParameters *PARAMETERS // store parsed parameters for dynamic targets
+	immediateRetry bool
+)
 
 // debugPrintf prints a yellow-colored formatted line when enabled is true.
 func debugPrintf(enabled bool, format string, a ...interface{}) {
@@ -50,41 +83,6 @@ func warningPrintf(format string, a ...interface{}) {
 	fmt.Printf(format, a...)
 	fmt.Print("\033[0m")
 }
-
-const (
-	MAXLCS   = 4
-	WIDTH    = 21
-	SHIFT    = 14
-	SHIFTIDX = 6
-)
-
-// Raw single-key input (Windows & other OS) using golang.org/x/term
-// We switch stdin to raw mode and read bytes directly without needing Enter.
-
-// Enums LMR, FB and BAY are provided by the `models` package. We removed
-// the local declarations to avoid redeclaration errors and use aliases below.
-
-// Use canonical models from the `models` package. These type aliases keep the
-// rest of the code using the short names (e.g., PARAMETERS, BAR) while pointing
-// at the exported types in the models package.
-type PARAMETERS = models.PARAMETERS
-type SENTINEL = models.SENTINEL
-type VERSION = models.VERSION
-type SERIAL = models.SERIAL
-type BAR = models.BAR
-type LC = models.LC
-
-// Aliases for enums and math/serial types so existing signatures remain valid.
-type LMR = models.LMR
-type FB = models.FB
-type BAY = models.BAY
-
-var (
-	calibmsg       = "\nPut %d on the %s Bay on the %s side in the %s of the Shelf and Press 'C' to continue. Or <ESC> to exit."
-	zeromsg        = "\nClear the Bay(s) and Press 'C' to continue. Or <ESC> to exit."
-	lastParameters *PARAMETERS // store parsed parameters for dynamic targets
-	immediateRetry bool
-)
 
 // Backwards-compatible aliases: many call sites in main.go use unqualified
 // function names (from the pre-refactor single-file layout). Provide thin
@@ -137,8 +135,18 @@ func main() {
 		log.Fatal("Usage: calrunrilla <config.json>")
 	}
 
+	// Route the standard logger output through our package-scope redWriter
+	log.SetFlags(0)
+	log.SetOutput(redWriter{os.Stderr})
+
 	if doTestOnly {
-		// Load parameters and immediately run testWeights using the serial port
+		// Clear screen like regular mode
+		clearScreen()
+		// Print startup banner similar to regular mode
+		greenPrintf("Runrilla Calibration version: %s [build %s]\n", AppVersion, AppBuild)
+		greenPrintf("--------------------------------------------\n")
+
+		// Load parameters and mirror the serial validation/probe behavior from calRunrilla
 		jsonData, err := os.ReadFile(configPath)
 		if err != nil {
 			log.Fatalf("Error reading file: %v", err)
@@ -148,33 +156,80 @@ func main() {
 			log.Fatalf("JSON error: %v", err)
 		}
 		lastParameters = &parameters
+		debugPrintf(true, "Loaded config: %s (DEBUG=%v)\n", configPath, parameters.DEBUG)
+
 		if parameters.SERIAL == nil {
 			log.Fatal("Missing SERIAL section in JSON")
 		}
-		// Try to open serial / auto-detect as in calRunrilla
+		// Serial validation/auto-detect (same as calRunrilla)
+		debugPrintf(true, "Validating SERIAL configuration...\n")
 		needDetect := false
 		if parameters.SERIAL.PORT == "" {
+			debugPrintf(true, "Serial PORT missing in JSON, attempting auto-detect...\n")
 			needDetect = true
 		} else {
+			debugPrintf(true, "Trying configured port: %s (baud %d)\n", parameters.SERIAL.PORT, parameters.SERIAL.BAUDRATE)
 			cfg := &serial.Config{Name: parameters.SERIAL.PORT, Baud: parameters.SERIAL.BAUDRATE, Parity: serial.ParityNone, Size: 8, StopBits: serial.Stop1, ReadTimeout: time.Millisecond * 300}
 			sp, err := serial.OpenPort(cfg)
 			if err != nil {
+				log.Printf("Port %s open failed (%v), attempting auto-detect...\n", parameters.SERIAL.PORT, err)
 				needDetect = true
 			} else {
 				_ = sp.Close()
 			}
 		}
 		if needDetect {
+			debugPrintf(true, "Starting serial auto-detect across COM ports (this may take a few seconds)...\n")
 			p := autoDetectPort(&parameters)
 			if p == "" {
 				log.Fatal("Could not auto-detect serial port")
 			}
 			parameters.SERIAL.PORT = p
+			persistParameters(configPath, &parameters)
+			debugPrintf(true, "Detected serial port: %s (saved to JSON)\n", p)
+		}
+
+		debugPrintf(true, "Opening Leo485 with port %s...\n", parameters.SERIAL.PORT)
+		bars := serialpkg.NewLeo485(parameters.SERIAL, parameters.BARS)
+		defer func() { _ = bars.Close() }()
+
+		// Probe version and attempt reboot/auto-detect fallback like calRunrilla
+		debugPrintf(true, "Probing device version...\n")
+		if !probeVersion(bars, &parameters) {
+			log.Printf("No version response from %s. Attempting reboot of all bars...\n", parameters.SERIAL.PORT)
+			for i := range bars.Bars {
+				if bars.Reboot(i) {
+					greenPrintf("Bar %d reboot command sent\n", i+1)
+				} else {
+					log.Printf("Bar %d reboot command failed or no response\n", i+1)
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+			greenPrintf("Waiting for bars to reboot...\n")
+			time.Sleep(1500 * time.Millisecond)
+			if probeVersion(bars, &parameters) {
+				greenPrintf("Version response received after reboot\n")
+			} else {
+				log.Printf("No version response from %s after reboot, re-attempting auto-detect...\n", parameters.SERIAL.PORT)
+				_ = bars.Close()
+				p := autoDetectPort(&parameters)
+				if p != "" && p != parameters.SERIAL.PORT {
+					parameters.SERIAL.PORT = p
+					persistParameters(configPath, &parameters)
+					debugPrintf(true, "Updated serial port after probe: %s (saved)\n", p)
+					bars = serialpkg.NewLeo485(parameters.SERIAL, parameters.BARS)
+					defer func() { _ = bars.Close() }()
+				}
+			}
+		}
+
+		// Full version validation (will continue even if minor mismatch)
+		if !checkVersion(bars, &parameters) {
+			// Version check failed but continue
+			warningPrintf("Warning: version check failed, continuing anyway\n")
 		}
 
 		greenPrintf("\nOpening serial port %s for test...\n", parameters.SERIAL.PORT)
-		bars := serialpkg.NewLeo485(parameters.SERIAL, parameters.BARS)
-		defer func() { _ = bars.Close() }()
 		testWeights(bars, &parameters)
 		return
 	}
@@ -212,14 +267,40 @@ func main() {
 		if choice == 'T' {
 			// Run weight test using lastParameters if available
 			if lastParameters != nil && lastParameters.SERIAL != nil {
+				// Clear screen and show banner like regular mode, then jump to test
+				clearScreen()
+				greenPrintf("Runrilla Calibration version: %s [build %s]\n", AppVersion, AppBuild)
+				greenPrintf("--------------------------------------------\n")
 				ui.DrainKeys()
-				greenPrintf("\nOpening serial port %s for test...\n", lastParameters.SERIAL.PORT)
+				// Ensure serial PORT is usable; if not, attempt auto-detect and persist the result
+				needDetect := false
+				if lastParameters.SERIAL.PORT == "" {
+					needDetect = true
+				} else {
+					cfg := &serial.Config{Name: lastParameters.SERIAL.PORT, Baud: lastParameters.SERIAL.BAUDRATE, Parity: serial.ParityNone, Size: 8, StopBits: serial.Stop1, ReadTimeout: time.Millisecond * 300}
+					sp, err := serial.OpenPort(cfg)
+					if err != nil {
+						needDetect = true
+					} else {
+						_ = sp.Close()
+					}
+				}
+				if needDetect {
+					p := autoDetectPort(lastParameters)
+					if p == "" {
+						warningPrintf("Could not auto-detect serial port for test\n")
+						// fall back: try to proceed and let NewLeo485 fail with clear error
+					} else {
+						lastParameters.SERIAL.PORT = p
+						// Persist updated port to JSON so user's config reflects detected port
+						persistParameters(configPath, lastParameters)
+						greenPrintf("Auto-detected serial port %s (saved)\n", p)
+					}
+				}
+				// Open serial and run test
 				bars := serialpkg.NewLeo485(lastParameters.SERIAL, lastParameters.BARS)
-				_ = bars.Close()
-				// Reopen to ensure clean state and run test
-				bars = serialpkg.NewLeo485(lastParameters.SERIAL, lastParameters.BARS)
+				defer func() { _ = bars.Close() }()
 				testWeights(bars, lastParameters)
-				_ = bars.Close()
 			} else {
 				warningPrintf("No parameters available for testing\n")
 			}
@@ -640,7 +721,6 @@ func testWeights(bars *serialpkg.Leo485, parameters *PARAMETERS) {
 	}
 
 	// Show the zero references we just collected so the operator can inspect them
-	// Print in the same orange style used for factors/zeros in other debug output
 	fmt.Print("\033[38;5;208m")
 	fmt.Println(matrix.MatrixLine)
 	fmt.Println("zeros (averaged)")
@@ -1717,4 +1797,5 @@ func persistParameters(path string, parameters *PARAMETERS) {
 	if writeErr := os.WriteFile(path, data, 0644); writeErr != nil {
 		fmt.Println("Cannot write parameters file:", writeErr)
 	}
+	greenPrintf("Saved updated parameters to %s\n", path)
 }

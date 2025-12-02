@@ -1,8 +1,10 @@
 package serial
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -160,6 +162,89 @@ func (l *Leo485) Reboot(index int) bool {
 	return strings.Contains(response, "Rebooting")
 }
 
+// GetDeviceFactors queries the device with command 'X' for factors and parses
+// the response containing IEEE754 floats. Returns a slice of float64 of length
+// l.NLCs or an error on failure.
+func (l *Leo485) GetDeviceFactors(index int) ([]float64, error) {
+	cmd := GetCommand(l.Bars[index].ID, []byte("X"))
+	resp, err := changeState(l.Serial, cmd, 300)
+	if err != nil || len(resp) == 0 {
+		return nil, err
+	}
+	b := []byte(resp)
+	nlcs := l.NLCs
+
+	anchorBE := []byte{0x3F, 0x80, 0x00, 0x00}
+	anchorLE := []byte{0x00, 0x00, 0x80, 0x3F}
+	for i := 0; i+4 <= len(b); i++ {
+		if i+4+4*nlcs <= len(b) && (equalBytes(b[i:i+4], anchorBE) || equalBytes(b[i:i+4], anchorLE)) {
+			start := i + 4
+			vals := make([]float64, nlcs)
+			useLE := equalBytes(b[i:i+4], anchorLE)
+			ok := true
+			for j := 0; j < nlcs; j++ {
+				off := start + j*4
+				chunk := b[off : off+4]
+				var u uint32
+				if useLE {
+					u = binary.LittleEndian.Uint32(chunk)
+				} else {
+					u = binary.BigEndian.Uint32(chunk)
+				}
+				f := math.Float32frombits(u)
+				ff := float64(f)
+				if math.IsNaN(ff) || math.IsInf(ff, 0) || math.Abs(ff) > 1e6 {
+					ok = false
+					break
+				}
+				vals[j] = float64(f)
+			}
+			if ok {
+				return vals, nil
+			}
+		}
+	}
+
+	needed := 4 * nlcs
+	for start := 0; start+needed <= len(b); start++ {
+		window := b[start : start+needed]
+		valsBE := make([]float64, nlcs)
+		valsLE := make([]float64, nlcs)
+		validBE := true
+		validLE := true
+		anyReasonableBE := false
+		anyReasonableLE := false
+		for i := 0; i < nlcs; i++ {
+			chunk := window[i*4 : i*4+4]
+			uBE := binary.BigEndian.Uint32(chunk)
+			uLE := binary.LittleEndian.Uint32(chunk)
+			fBE := math.Float32frombits(uBE)
+			fLE := math.Float32frombits(uLE)
+			valsBE[i] = float64(fBE)
+			valsLE[i] = float64(fLE)
+			if math.IsNaN(valsBE[i]) || math.IsInf(valsBE[i], 0) || math.Abs(valsBE[i]) > 1e6 {
+				validBE = false
+			}
+			if math.IsNaN(valsLE[i]) || math.IsInf(valsLE[i], 0) || math.Abs(valsLE[i]) > 1e6 {
+				validLE = false
+			}
+			if math.Abs(valsBE[i]) > 1e-6 {
+				anyReasonableBE = true
+			}
+			if math.Abs(valsLE[i]) > 1e-6 {
+				anyReasonableLE = true
+			}
+		}
+		if validBE && anyReasonableBE {
+			return valsBE, nil
+		}
+		if validLE && anyReasonableLE {
+			return valsLE, nil
+		}
+	}
+	return nil, fmt.Errorf("no valid factors found in response")
+}
+
 func numOfActiveLCs(lcs byte) int {
 	count := 0
 	for i := 0; i < 8; i++ {
@@ -168,6 +253,19 @@ func numOfActiveLCs(lcs byte) int {
 		}
 	}
 	return count
+}
+
+// equalBytes compares two byte slices for equality (helper internal to serial package)
+func equalBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // The lower-level serial helpers are implemented in com.go in this package.
