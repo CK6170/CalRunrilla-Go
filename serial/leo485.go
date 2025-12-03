@@ -1,8 +1,11 @@
 package serial
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -158,6 +161,81 @@ func (l *Leo485) Reboot(index int) bool {
 		return false
 	}
 	return strings.Contains(response, "Rebooting")
+}
+
+// ReadFactors queries a bar for its stored factors using the 'X' read command.
+// Response payload format: 4 bytes totalFactor (IEEE754) followed by 4-byte IEEE754 factors
+// for each active LC. Returns slice of factors (float64) or an error.
+func (l *Leo485) ReadFactors(index int) ([]float64, error) {
+	cmd := GetCommand(l.Bars[index].ID, []byte("X"))
+	// Send command and get raw bytes (no textual parsing)
+	raw, err := sendCommand(l.Serial, cmd, 300)
+	if err != nil {
+		return nil, fmt.Errorf("ReadFactors sendCommand error: %v", err)
+	}
+	if len(raw) < 6 {
+		return nil, fmt.Errorf("ReadFactors: response too short: %d bytes", len(raw))
+	}
+
+	// find CRLF or LF
+	rnPos := bytes.Index(raw, []byte("\r\n"))
+	if rnPos == -1 {
+		rnPos = bytes.IndexByte(raw, '\n')
+	}
+	if rnPos == -1 {
+		return nil, fmt.Errorf("ReadFactors: no line terminator in response; len=%d", len(raw))
+	}
+
+	// Validate ID bytes (first two bytes of response should match cmd[:2])
+	if len(raw) < 2 || raw[0] != cmd[0] || raw[1] != cmd[1] {
+		// provide a hex dump for diagnostics
+		hexParts := make([]string, 0, len(raw))
+		for _, b := range raw {
+			hexParts = append(hexParts, fmt.Sprintf("%02X", b))
+		}
+		return nil, fmt.Errorf("ReadFactors GetData error: wrong ID or missing pipe; raw_len=%d raw_hex=%s", len(raw), strings.Join(hexParts, " "))
+	}
+
+	if rnPos < 2 {
+		return nil, fmt.Errorf("ReadFactors: response too short before CRC/terminator")
+	}
+
+	// CRC is the two bytes immediately before CR/LF
+	if rnPos < 2 {
+		return nil, fmt.Errorf("ReadFactors: no CRC present")
+	}
+	receivedCRC := raw[rnPos-2 : rnPos]
+	dataForCRC := raw[:rnPos-2]
+	calc := crc16(dataForCRC)
+	if receivedCRC[0] != calc[0] || receivedCRC[1] != calc[1] {
+		// hex dump for diagnostics
+		hexParts := make([]string, 0, len(raw))
+		for _, b := range raw {
+			hexParts = append(hexParts, fmt.Sprintf("%02X", b))
+		}
+		return nil, fmt.Errorf("ReadFactors CRC mismatch: expected=%02X%02X got=%02X%02X raw_hex=%s", calc[0], calc[1], receivedCRC[0], receivedCRC[1], strings.Join(hexParts, " "))
+	}
+
+	// payload starts right after the 2-byte ID (no ASCII pipe expected for binary payloads)
+	payload := raw[2 : rnPos-2]
+	nlcs := l.NLCs
+	expected := 4 * (1 + nlcs) // total + each factor (4 bytes each)
+	if len(payload) < expected {
+		return nil, fmt.Errorf("ReadFactors: payload too short: got %d, want %d", len(payload), expected)
+	}
+
+	ofs := 4 // skip totalFactor (first 4 bytes)
+	factors := make([]float64, nlcs)
+	for i := 0; i < nlcs; i++ {
+		if ofs+4 > len(payload) {
+			return nil, fmt.Errorf("ReadFactors: payload truncated for factor %d", i)
+		}
+		bits := binary.BigEndian.Uint32(payload[ofs : ofs+4])
+		f32 := math.Float32frombits(bits)
+		factors[i] = float64(f32)
+		ofs += 4
+	}
+	return factors, nil
 }
 
 func numOfActiveLCs(lcs byte) int {

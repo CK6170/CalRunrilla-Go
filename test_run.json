@@ -1,6 +1,6 @@
 {
   "SERIAL": {
-    "PORT": "COM6",
+    "PORT": "COM4",
     "BAUDRATE": 115200,
     "COMMAND": "M"
   },
@@ -10,7 +10,7 @@
     "MINOR": 202
   },
   "WEIGHT": 500,
-  "AVG": 15,
+  "AVG": 2,
   "IGNORE": 2,
   "DEBUG": true,
   "BARS": [
