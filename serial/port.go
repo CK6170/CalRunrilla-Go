@@ -2,6 +2,9 @@ package serial
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -13,9 +16,28 @@ import (
 func AutoDetectPort(parameters *models.PARAMETERS) string {
 	expectedFirstBarID := parameters.BARS[0].ID
 	baud := parameters.SERIAL.BAUDRATE
-	// Scan COM1..COM64
-	for i := 1; i <= 64; i++ {
-		portName := fmt.Sprintf("COM%d", i)
+	if runtime.GOOS == "windows" {
+		// Scan COM1..COM64
+		for i := 1; i <= 64; i++ {
+			portName := fmt.Sprintf("COM%d", i)
+			if TestPort(portName, expectedFirstBarID, baud) {
+				return portName
+			}
+		}
+		return ""
+	}
+
+	// Unix-like: try common device paths.
+	candidates := make([]string, 0, 32)
+	for _, pat := range []string{"/dev/ttyUSB*", "/dev/ttyACM*", "/dev/ttyS*", "/dev/cu.*"} {
+		matches, _ := filepath.Glob(pat)
+		for _, m := range matches {
+			if _, err := os.Stat(m); err == nil {
+				candidates = append(candidates, m)
+			}
+		}
+	}
+	for _, portName := range candidates {
 		if TestPort(portName, expectedFirstBarID, baud) {
 			return portName
 		}
