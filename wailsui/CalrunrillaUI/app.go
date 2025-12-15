@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/CK6170/Calrunrilla-go/matrix"
-	"github.com/CK6170/Calrunrilla-go/modern"
-	serialpkg "github.com/CK6170/Calrunrilla-go/serial"
+	"CalrunrillaUI/internal/calrunrilla/matrix"
+	"CalrunrillaUI/internal/calrunrilla/modern"
+	serialpkg "CalrunrillaUI/internal/calrunrilla/serial"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
