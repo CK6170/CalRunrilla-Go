@@ -1,4 +1,4 @@
-module CalrunrillaUI
+module github.com/CK6170/CalrunrillaUI
 
 go 1.25.0
 
