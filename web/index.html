@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Calrunrilla Web UI</title>
+    <link rel="stylesheet" href="/assets/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="logo">CR</div>
+          <div>
+            <div class="title">Calrunrilla</div>
+            <div class="subtitle">Serial backend + web UI</div>
+          </div>
+        </div>
+        <div class="status" id="statusText">Disconnected</div>
+      </header>
+
+      <main class="content">
+        <section class="card" id="entryCard">
+          <h2>Entry</h2>
+          <p class="muted">Upload your <code>config.json</code>, connect to the device, then choose a mode.</p>
+
+          <div class="row">
+            <label class="file">
+              <input id="configFile" type="file" accept=".json" />
+              <span>Choose config.json</span>
+            </label>
+            <button class="btn primary" id="btnUploadConnect">Upload + Connect</button>
+            <button class="btn" id="btnDisconnect">Disconnect</button>
+          </div>
+
+          <div class="row">
+            <button class="btn" id="goCalibration">Calibration</button>
+            <button class="btn" id="goTest">Test</button>
+            <button class="btn" id="goFlash">Flash</button>
+          </div>
+
+          <div class="divider"></div>
+          <div class="log" id="entryLog"></div>
+        </section>
+
+        <section class="card hidden" id="calibrationCard">
+          <div class="cardHeader">
+            <h2>Calibration</h2>
+            <div class="spacer"></div>
+            <button class="btn" id="calBack">Back</button>
+          </div>
+          <div class="muted" id="calStepText">Loading plan…</div>
+          <div class="row">
+            <button class="btn" id="calPrev">Prev</button>
+            <button class="btn" id="calNext">Next</button>
+            <button class="btn primary" id="calStartStep">Start step</button>
+          </div>
+          <pre class="mono" id="calLive"></pre>
+          <div class="log" id="calLog"></div>
+        </section>
+
+        <section class="card hidden" id="testCard">
+          <div class="cardHeader">
+            <h2>Test</h2>
+            <div class="spacer"></div>
+            <button class="btn" id="testBack">Back</button>
+          </div>
+          <div class="row">
+            <button class="btn primary" id="testStart">Start</button>
+            <button class="btn" id="testStop">Stop</button>
+          </div>
+          <div class="muted" id="testZeros"></div>
+          <div class="totals" id="testTotals"></div>
+          <div id="testTable"></div>
+          <div class="log" id="testLog"></div>
+        </section>
+
+        <section class="card hidden" id="flashCard">
+          <div class="cardHeader">
+            <h2>Flash</h2>
+            <div class="spacer"></div>
+            <button class="btn" id="flashBack">Back</button>
+          </div>
+          <p class="muted">Upload a <code>*_calibrated.json</code> and flash its factors to the device.</p>
+          <div class="row">
+            <label class="file">
+              <input id="calibratedFile" type="file" accept=".json" />
+              <span>Choose *_calibrated.json</span>
+            </label>
+            <button class="btn primary" id="flashUploadStart">Upload + Flash</button>
+            <button class="btn" id="flashStop">Stop</button>
+          </div>
+          <div class="muted" id="flashProgress"></div>
+          <div class="log" id="flashLog"></div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>
+
