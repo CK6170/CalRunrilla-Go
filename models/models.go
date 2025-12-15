@@ -1,5 +1,7 @@
 package models
 
+import "fmt"
+
 // Constants related to layout
 const (
 	MAXLCS   = 4
@@ -26,7 +28,7 @@ func (l LMR) String() string {
 	case RIGHT:
 		return "RIGHT"
 	default:
-		return "LMR(" + string(int(l)) + ")"
+		return fmt.Sprintf("LMR(%d)", int(l))
 	}
 }
 
@@ -44,7 +46,7 @@ func (f FB) String() string {
 	case BACK:
 		return "BACK"
 	default:
-		return "FB(" + string(int(f)) + ")"
+		return fmt.Sprintf("FB(%d)", int(f))
 	}
 }
 
@@ -80,7 +82,7 @@ func (b BAY) String() string {
 	case EIGHTH:
 		return "EIGHTH"
 	default:
-		return "BAY(" + string(int(b)) + ")"
+		return fmt.Sprintf("BAY(%d)", int(b))
 	}
 }
 

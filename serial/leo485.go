@@ -23,7 +23,18 @@ type Leo485 struct {
 	SerialConfig *models.SERIAL
 }
 
-func NewLeo485(ser *models.SERIAL, bars []*models.BAR) *Leo485 {
+// OpenLeo485 opens the serial port and validates the bar configuration.
+// It returns an error instead of exiting the process, so UIs can handle failures.
+func OpenLeo485(ser *models.SERIAL, bars []*models.BAR) (*Leo485, error) {
+	if ser == nil {
+		return nil, fmt.Errorf("serial config is nil")
+	}
+	if ser.PORT == "" {
+		return nil, fmt.Errorf("serial PORT is empty")
+	}
+	if len(bars) == 0 {
+		return nil, fmt.Errorf("no bars configured")
+	}
 	config := &goserial.Config{
 		Name:        ser.PORT,
 		Baud:        ser.BAUDRATE,
@@ -34,7 +45,7 @@ func NewLeo485(ser *models.SERIAL, bars []*models.BAR) *Leo485 {
 	}
 	port, err := goserial.OpenPort(config)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	l := &Leo485{
 		Serial:       port,
@@ -44,8 +55,17 @@ func NewLeo485(ser *models.SERIAL, bars []*models.BAR) *Leo485 {
 	l.NLCs = numOfActiveLCs(bars[0].LCS)
 	for _, bar := range bars {
 		if numOfActiveLCs(bar.LCS) != l.NLCs {
-			log.Fatal("Number of Load Cells per bar must match")
+			_ = port.Close()
+			return nil, fmt.Errorf("number of load cells per bar must match")
 		}
+	}
+	return l, nil
+}
+
+func NewLeo485(ser *models.SERIAL, bars []*models.BAR) *Leo485 {
+	l, err := OpenLeo485(ser, bars)
+	if err != nil {
+		log.Fatal(err)
 	}
 	return l
 }
